@@ -1,9 +1,24 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split
+from torchvision import transforms
+from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
+import torchvision
+import torchvision.models as models
+from torch.optim import AdamW
+from torch.nn import MSELoss
+from sklearn.model_selection import train_test_split
+from kornia import color
 from tqdm import tqdm
+from pathlib import Path
 from PIL import Image
 import os
 import matplotlib.pyplot as plt
+import logging
+import argparse
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 INTERVAL = 10
 INTERVAL_SQUARED = INTERVAL**2
@@ -30,16 +45,7 @@ class WeightedMSELoss(nn.MSELoss):
         weighted_mse_loss = (mse_loss * value_embeddings).mean()
         return weighted_mse_loss
 
-import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split
-from torchvision import transforms
-from pathlib import Path
-from PIL import Image
-from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
-# from torchsummary import summary
-from kornia import color
-
-class Places365Train(Dataset):
+class datasetTrain(Dataset):
     def __init__(self, root: Path):
         self.data_dir = root
         self.data_paths = list(self.data_dir.rglob("*.jpg"))
@@ -92,43 +98,6 @@ def resize_images(directory):
                 break
             img = img.resize((256, 256), Image.LANCZOS)  # Resize with high-quality resampling
             img.save(img_path, quality=95)  
-
-directory = "./val2014"
-vid_directory = 'DAVIS/JPEGImages/480p'
-
-for folder in os.listdir(vid_directory):
-    path = os.path.join(vid_directory, folder)
-    resize_images(path)
-
-dataset = Places365Train(Path(directory))
-vid_dataset = Places365Train(Path(vid_directory))
-
-import torch
-from torch.utils.data import random_split
-
-train_ratio = 0.8
-test_ratio = 0.2  
-dataset_size = len(dataset)
-train_size = int(train_ratio * dataset_size)
-test_size = dataset_size - train_size
-
-train_set, val_set = random_split(dataset, [train_size, test_size])
-
-occurrence = torch.zeros(NUM_BINS)
-for data in tqdm(vid_dataset):
-    rgb_image = data[1]
-    key = convert_rgb_tensor_to_key(rgb_image).view(-1)
-    bin_counts = torch.bincount(key, minlength = NUM_BINS)
-    occurrence += bin_counts
-
-import matplotlib.pyplot as plt
-
-probabilities = (occurrence/torch.sum(occurrence)).view(-1)
-probabilities = -torch.log(probabilities+1e-6).view(-1,1)
-
-value_embedding = nn.Embedding(num_embeddings=NUM_BINS, embedding_dim=1) 
-value_embedding.weight.data = probabilities
-value_embedding = value_embedding.to("cuda")
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels: int, out_channels: int, upsample=1):
@@ -223,39 +192,8 @@ class ConvNetWithEfficientNetFeatureExtractor(torch.nn.Module):
         lab_img[1:] = output
         return Places365Train.lab_to_rgb(lab_img)
 
-#train model
-
-from torch.optim import AdamW
-from torch.nn import MSELoss
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ConvNetWithEfficientNetFeatureExtractor().to(device)
-optimizer = AdamW(model.parameters(), lr=1e-3)
-mseloss = MSELoss()
-weighted_mseloss = WeightedMSELoss(value_embedding)
-
-import torchvision
-import torchvision.models as models
-
-# Load the pre-trained VGG11 model
-vgg11 = models.vgg11(pretrained=True)
-
-vgg11.features[-1]=torch.nn.Identity()
-vgg11 = vgg11.features
-
-for param in vgg11.parameters():
-    param.requires_grad = False
-    
-vgg11 = vgg11.to(device)
-
-train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
-vid_loader = DataLoader(vid_dataset, batch_size=64, shuffle=True)
-
 PERCEPTUAL_LOSS_WEIGHT = 0.3
-def train(model, train_loader, val_loader, loss1, loss2, optimizer, device, epochs=10):
+def train(model, vgg11, train_loader, val_loader, loss1, loss2, optimizer, device, epochs=10):
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -287,11 +225,72 @@ def train(model, train_loader, val_loader, loss1, loss2, optimizer, device, epoc
                 val_loss += loss.item()
 #             val_loss /= len(val_loader)
 
-        print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        # print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        logging.info(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
-# train(model, train_loader, val_loader, weighted_mseloss, mseloss, optimizer, device, epochs=1)
-# train(model, vid_loader, None, weighted_mseloss, mseloss, optimizer, device, epochs=1)
+def main(directory, vid_directory, epochs):
+    # directory = "./val2014"
+    # vid_directory = './DAVIS/JPEGImages/480p'
 
-torch.save(model.state_dict(), "model.pth")
+    for folder in os.listdir(vid_directory):
+        path = os.path.join(vid_directory, folder)
+        resize_images(path)
 
-torch.cuda.empty_cache()
+    dataset = datasetTrain(Path(directory))
+    vid_dataset = datasetTrain(Path(vid_directory))
+
+    train_ratio = 0.8
+    test_ratio = 0.2  
+    dataset_size = len(dataset)
+    train_size = int(train_ratio * dataset_size)
+    test_size = dataset_size - train_size
+
+    train_set, val_set = random_split(dataset, [train_size, test_size])
+
+    occurrence = torch.zeros(NUM_BINS)
+    for data in tqdm(vid_dataset):
+        rgb_image = data[1]
+        key = convert_rgb_tensor_to_key(rgb_image).view(-1)
+        bin_counts = torch.bincount(key, minlength = NUM_BINS)
+        occurrence += bin_counts
+
+    probabilities = (occurrence/torch.sum(occurrence)).view(-1)
+    probabilities = -torch.log(probabilities+1e-6).view(-1,1)
+
+    value_embedding = nn.Embedding(num_embeddings=NUM_BINS, embedding_dim=1) 
+    value_embedding.weight.data = probabilities
+    value_embedding = value_embedding.to("cuda")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ConvNetWithEfficientNetFeatureExtractor().to(device)
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    mseloss = MSELoss()
+    weighted_mseloss = WeightedMSELoss(value_embedding)
+
+    vgg11 = models.vgg11(pretrained=True)
+    vgg11.features[-1]=torch.nn.Identity()
+    vgg11 = vgg11.features
+
+    for param in vgg11.parameters():
+        param.requires_grad = False
+        
+    vgg11 = vgg11.to(device)
+
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
+    vid_loader = DataLoader(vid_dataset, batch_size=64, shuffle=True)
+
+    train(model, vgg11, train_loader, val_loader, weighted_mseloss, mseloss, optimizer, device, epochs)
+
+    torch.save(model.state_dict(), "model.pth")
+    torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Training model.")
+    parser.add_argument("--training_dataset_directory", type=str, help="Dataset directory for training (default = ./val2014)", default="./val2014")
+    parser.add_argument("--sample_dataset_directory", type=str, help="Dataset directory for sample inference (default = ./DAVIS/JPEGImages/480p)", default="./DAVIS/JPEGImages/480p")
+    parser.add_argument("--epochs", type=int, help="Number of epochs (default = 2)", default=2)
+    args = parser.parse_args()
+
+    main(args.training_dataset_directory, args.sample_dataset_directory, args.epochs)
+

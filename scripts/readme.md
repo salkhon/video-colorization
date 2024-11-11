@@ -16,16 +16,20 @@ rm ./val2014.zip
 ```
 
 # Training scripts
-Training (no pruning/quantization):
+### Training (no pruning/quantization):
 ```
 python train.py
 ```
+Optional parameters: `--training_dataset_directory`, `--sample_dataset_directory`, `--epochs`
 
-Training with pruning (after normal training):
+### Training with pruning (after normal training):
 ```
 python train_with_pruning.py
 ```
-Quantize pruned model (after training with pruning):
+Optional parameters: `--training_dataset_directory`, `--sample_dataset_directory`
+
+### Quantize pruned model (after training with pruning):
 ```
 python train_with_pruning_quantize.py
 ```
+Optional parameters: `--training_dataset_directory`, `--sample_dataset_directory`

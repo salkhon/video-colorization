@@ -1,9 +1,25 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split, Subset
+from torchvision import transforms
+from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
+import torchvision
+import torchvision.models as models
+from torch.optim import AdamW
+from torch.nn import MSELoss
+from sklearn.model_selection import train_test_split
+from kornia import color
 from tqdm import tqdm
+from pathlib import Path
 from PIL import Image
 import os
 import matplotlib.pyplot as plt
+import copy
+import logging
+import argparse
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 INTERVAL = 10
 INTERVAL_SQUARED = INTERVAL**2
@@ -30,16 +46,7 @@ class WeightedMSELoss(nn.MSELoss):
         weighted_mse_loss = (mse_loss * value_embeddings).mean()
         return weighted_mse_loss
 
-import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split
-from torchvision import transforms
-from pathlib import Path
-from PIL import Image
-from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
-# from torchsummary import summary
-from kornia import color
-
-class Places365Train(Dataset):
+class datasetTrain(Dataset):
     def __init__(self, root: Path):
         self.data_dir = root
         self.data_paths = list(self.data_dir.rglob("*.jpg"))
@@ -92,43 +99,6 @@ def resize_images(directory):
                 break
             img = img.resize((256, 256), Image.LANCZOS)  # Resize with high-quality resampling
             img.save(img_path, quality=95)  
-
-directory = "./val2014"
-vid_directory = './DAVIS/JPEGImages/480p'
-
-for folder in os.listdir(vid_directory):
-    path = os.path.join(vid_directory, folder)
-    resize_images(path)
-
-dataset = Places365Train(Path(directory))
-vid_dataset = Places365Train(Path(vid_directory))
-
-import torch
-from torch.utils.data import random_split
-
-train_ratio = 0.8
-test_ratio = 0.2  
-dataset_size = len(dataset)
-train_size = int(train_ratio * dataset_size)
-test_size = dataset_size - train_size
-
-train_set, val_set = random_split(dataset, [train_size, test_size])
-
-occurrence = torch.zeros(NUM_BINS)
-for data in tqdm(vid_dataset):
-    rgb_image = data[1]
-    key = convert_rgb_tensor_to_key(rgb_image).view(-1)
-    bin_counts = torch.bincount(key, minlength = NUM_BINS)
-    occurrence += bin_counts
-
-import matplotlib.pyplot as plt
-
-probabilities = (occurrence/torch.sum(occurrence)).view(-1)
-probabilities = -torch.log(probabilities+1e-6).view(-1,1)
-
-value_embedding = nn.Embedding(num_embeddings=NUM_BINS, embedding_dim=1) 
-value_embedding.weight.data = probabilities
-value_embedding = value_embedding.to("cuda")
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels: int, out_channels: int, upsample=1):
@@ -222,36 +192,8 @@ class ConvNetWithEfficientNetFeatureExtractor(torch.nn.Module):
         lab_img = x.clone()
         lab_img[1:] = output
         return Places365Train.lab_to_rgb(lab_img)
-    
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ConvNetWithEfficientNetFeatureExtractor().to(device)
-
-train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
-vid_loader = DataLoader(vid_dataset, batch_size=64, shuffle=True)
-
-import copy
-model = ConvNetWithEfficientNetFeatureExtractor()
-model.load_state_dict(torch.load("./model_p.pth"))
-model2 = copy.deepcopy(model)
-model2 = model2.to("cpu")
-val_loader = DataLoader(val_set, batch_size=256, shuffle=True)
-
-feature32 = model2.feature_extractor[0:2](x) 
-feature48 = model2.feature_extractor[2](feature32) 
-feature80 = model2.feature_extractor[3](feature48) 
-feature224 = model2.feature_extractor[4:6](feature80)
-feature640 = model2.feature_extractor[6:8](feature224)
-feature2560 = model2.feature_extractor[8](feature640)
-
-import torch
-from torch import nn
-import copy
 
 backend = "fbgemm"
-m = copy.deepcopy(model2).to("cpu")
-m.eval()
 ITERATIONS = 5
 
 def get_quantized(layer, sample_input):
@@ -267,17 +209,69 @@ def get_quantized(layer, sample_input):
     torch.quantization.convert(q, inplace=True)
     return q, out
 
-q0, out = get_quantized(m.colorization_layers[0],feature2560)
-q1, out = get_quantized(m.colorization_layers[1:3],feature640+out)
-q2, out = get_quantized(m.colorization_layers[3:5],feature224+out)
-q3, out = get_quantized(m.colorization_layers[5],feature80+out)
-q4, out = get_quantized(m.colorization_layers[6],feature48+out)
-q5, out = get_quantized(m.colorization_layers[7:10],feature32+out)
+def main(directory, vid_directory):
+    # directory = "./val2014"
+    # vid_directory = './DAVIS/JPEGImages/480p'
 
-val_loader = DataLoader(val_set, batch_size=1000)
+    for folder in os.listdir(vid_directory):
+        path = os.path.join(vid_directory, folder)
+        resize_images(path)
 
-model2.colorization_layers = nn.Sequential(q0,q1,q2,q3,q4,q5)
-model2.quantized = True
+    dataset = datasetTrain(Path(directory))
+    vid_dataset = datasetTrain(Path(vid_directory))
 
-torch.save(model2.state_dict(), "model_pq.pth")
-torch.cuda.empty_cache()
+    train_ratio = 0.8
+    test_ratio = 0.2  
+    dataset_size = len(dataset)
+    train_size = int(train_ratio * dataset_size)
+    test_size = dataset_size - train_size
+
+    train_set, val_set = random_split(dataset, [train_size, test_size])
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ConvNetWithEfficientNetFeatureExtractor().to(device)
+
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
+    vid_loader = DataLoader(vid_dataset, batch_size=64, shuffle=True)
+
+    model.load_state_dict(torch.load("./model_p.pth"))
+    model2 = copy.deepcopy(model)
+    model2 = model2.to("cpu")
+    val_loader = DataLoader(val_set, batch_size=256, shuffle=True)
+
+    for x,y in val_loader:
+        print(x.shape)
+        break
+
+    feature32 = model2.feature_extractor[0:2](x) 
+    feature48 = model2.feature_extractor[2](feature32) 
+    feature80 = model2.feature_extractor[3](feature48) 
+    feature224 = model2.feature_extractor[4:6](feature80)
+    feature640 = model2.feature_extractor[6:8](feature224)
+    feature2560 = model2.feature_extractor[8](feature640)
+
+    m = copy.deepcopy(model2).to("cpu")
+    m.eval()
+
+    q0, out = get_quantized(m.colorization_layers[0],feature2560)
+    q1, out = get_quantized(m.colorization_layers[1:3],feature640+out)
+    q2, out = get_quantized(m.colorization_layers[3:5],feature224+out)
+    q3, out = get_quantized(m.colorization_layers[5],feature80+out)
+    q4, out = get_quantized(m.colorization_layers[6],feature48+out)
+    q5, out = get_quantized(m.colorization_layers[7:10],feature32+out)
+
+    model2.colorization_layers = nn.Sequential(q0,q1,q2,q3,q4,q5)
+    model2.quantized = True
+
+    torch.save(model2.state_dict(), "model_pq.pth")
+    torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Training model.")
+    parser.add_argument("--training_dataset_directory", type=str, help="Dataset directory for training (default = ./val2014)", default="./val2014")
+    parser.add_argument("--sample_dataset_directory", type=str, help="Dataset directory for sample inference (default = ./DAVIS/JPEGImages/480p)", default="./DAVIS/JPEGImages/480p")
+    # parser.add_argument("--epochs", type=int, help="Number of epochs (default = 2)", default=2)
+    args = parser.parse_args()
+
+    main(args.training_dataset_directory, args.sample_dataset_directory)

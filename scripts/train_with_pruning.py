@@ -1,9 +1,25 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split, Subset
+from torchvision import transforms
+from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
+import torchvision
+import torchvision.models as models
+from torch.optim import AdamW
+from torch.nn import MSELoss
+from sklearn.model_selection import train_test_split
+from kornia import color
 from tqdm import tqdm
+from pathlib import Path
 from PIL import Image
 import os
 import matplotlib.pyplot as plt
+import copy
+import logging
+import argparse
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 INTERVAL = 10
 INTERVAL_SQUARED = INTERVAL**2
@@ -30,16 +46,7 @@ class WeightedMSELoss(nn.MSELoss):
         weighted_mse_loss = (mse_loss * value_embeddings).mean()
         return weighted_mse_loss
 
-import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, random_split
-from torchvision import transforms
-from pathlib import Path
-from PIL import Image
-from torchvision.models import efficientnet_b7, EfficientNet_B7_Weights
-# from torchsummary import summary
-from kornia import color
-
-class Places365Train(Dataset):
+class datasetTrain(Dataset):
     def __init__(self, root: Path):
         self.data_dir = root
         self.data_paths = list(self.data_dir.rglob("*.jpg"))
@@ -92,43 +99,6 @@ def resize_images(directory):
                 break
             img = img.resize((256, 256), Image.LANCZOS)  # Resize with high-quality resampling
             img.save(img_path, quality=95)  
-
-directory = "./val2014"
-vid_directory = './DAVIS/JPEGImages/480p'
-
-for folder in os.listdir(vid_directory):
-    path = os.path.join(vid_directory, folder)
-    resize_images(path)
-
-dataset = Places365Train(Path(directory))
-vid_dataset = Places365Train(Path(vid_directory))
-
-import torch
-from torch.utils.data import random_split
-
-train_ratio = 0.8
-test_ratio = 0.2  
-dataset_size = len(dataset)
-train_size = int(train_ratio * dataset_size)
-test_size = dataset_size - train_size
-
-train_set, val_set = random_split(dataset, [train_size, test_size])
-
-occurrence = torch.zeros(NUM_BINS)
-for data in tqdm(vid_dataset):
-    rgb_image = data[1]
-    key = convert_rgb_tensor_to_key(rgb_image).view(-1)
-    bin_counts = torch.bincount(key, minlength = NUM_BINS)
-    occurrence += bin_counts
-
-import matplotlib.pyplot as plt
-
-probabilities = (occurrence/torch.sum(occurrence)).view(-1)
-probabilities = -torch.log(probabilities+1e-6).view(-1,1)
-
-value_embedding = nn.Embedding(num_embeddings=NUM_BINS, embedding_dim=1) 
-value_embedding.weight.data = probabilities
-value_embedding = value_embedding.to("cuda")
 
 class Block(torch.nn.Module):
     def __init__(self, in_channels: int, out_channels: int, upsample=1):
@@ -223,39 +193,8 @@ class ConvNetWithEfficientNetFeatureExtractor(torch.nn.Module):
         lab_img[1:] = output
         return Places365Train.lab_to_rgb(lab_img)
 
-#train model
-
-from torch.optim import AdamW
-from torch.nn import MSELoss
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ConvNetWithEfficientNetFeatureExtractor().to(device)
-optimizer = AdamW(model.parameters(), lr=1e-3)
-mseloss = MSELoss()
-weighted_mseloss = WeightedMSELoss(value_embedding)
-
-import torchvision
-import torchvision.models as models
-
-# Load the pre-trained VGG11 model
-vgg11 = models.vgg11(pretrained=True)
-
-vgg11.features[-1]=torch.nn.Identity()
-vgg11 = vgg11.features
-
-for param in vgg11.parameters():
-    param.requires_grad = False
-    
-vgg11 = vgg11.to(device)
-
-train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
-vid_loader = DataLoader(vid_dataset, batch_size=64, shuffle=True)
-
 PERCEPTUAL_LOSS_WEIGHT = 0.3
-def train(model, train_loader, val_loader, loss1, loss2, optimizer, device, epochs=10):
+def train(model, vgg11, train_loader, val_loader, loss1, loss2, optimizer, device, epochs=10):
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -318,7 +257,7 @@ def get_next_conv_layer(layers, k):
     return -1
 
 def get_prev_conv_layer(layers, k):
-    for i in reverse(range(0,k)):
+    for i in reversed(range(0,k)):
         if isinstance(layers[i], nn.Conv2d):
             return i
     return -1
@@ -330,6 +269,7 @@ def find_index(layers, target):
     for i, layer in enumerate(layers):
         if layer == target:
             return i
+        
 def get_out_channel_importance(weight):
     out_channels = weight.shape[0]
     importances = []
@@ -339,98 +279,148 @@ def get_out_channel_importance(weight):
         importance = torch.linalg.norm(channel_weight)
         importances.append(importance.view(1))
     return torch.cat(importances)
+
 def get_keep_indices(conv_layer, p_ratio):
     n_keep = get_num_channels_to_keep(conv_layer.out_channels, p_ratio)
     importance = get_out_channel_importance(conv_layer.weight)
     sort_idx = torch.argsort(importance, descending=True)
     return sort_idx[:n_keep]
 
-import copy
-model = ConvNetWithEfficientNetFeatureExtractor()
-model.load_state_dict(torch.load("./model.pth"))
-model2 = copy.deepcopy(model)
+def main(directory, vid_directory):
+    # directory = "./val2014"
+    # vid_directory = './DAVIS/JPEGImages/480p'
 
-model2 = model2.to("cpu")
-model2.eval()
-layers = get_all_layers(model2.feature_extractor)
+    for folder in os.listdir(vid_directory):
+        path = os.path.join(vid_directory, folder)
+        resize_images(path)
 
-prune_type_1 = []
-prune_type_2 = []
-prune_type_3 = []
-prune_type_4 = []
+    dataset = datasetTrain(Path(directory))
+    vid_dataset = datasetTrain(Path(vid_directory))
 
+    train_ratio = 0.8
+    test_ratio = 0.2  
+    dataset_size = len(dataset)
+    train_size = int(train_ratio * dataset_size)
+    test_size = dataset_size - train_size
 
-for i in range(len(layers)-2):
-    if isinstance(layers[i], nn.Conv2d) and isinstance(layers[i+1], nn.BatchNorm2d):
-        if isinstance(layers[i+2], nn.SiLU):
-            prune_type_1.append(i)
-        else:
-            prune_type_2.append(i)
-    if isinstance(layers[i], nn.Conv2d) and isinstance(layers[i+1],nn.Conv2d):
-        prune_type_3.append(i)
-        prune_type_4.append(i+1)
+    train_set, val_set = random_split(dataset, [train_size, test_size])
 
+    occurrence = torch.zeros(NUM_BINS)
+    for data in tqdm(vid_dataset):
+        rgb_image = data[1]
+        key = convert_rgb_tensor_to_key(rgb_image).view(-1)
+        bin_counts = torch.bincount(key, minlength = NUM_BINS)
+        occurrence += bin_counts
 
-conv_layer = model2.colorization_layers[1].conv
-bn_layer =  model2.colorization_layers[1].bn
-next_conv =  model2.colorization_layers[2].conv
+    probabilities = (occurrence/torch.sum(occurrence)).view(-1)
+    probabilities = -torch.log(probabilities+1e-6).view(-1,1)
 
-p_ratio = 0.3
-n_keep = get_num_channels_to_keep(conv_layer.out_channels, p_ratio)
-keep_idx = get_keep_indices(conv_layer, p_ratio)
+    value_embedding = nn.Embedding(num_embeddings=NUM_BINS, embedding_dim=1) 
+    value_embedding.weight.data = probabilities
+    value_embedding = value_embedding.to("cuda")
 
-with torch.no_grad():
-    bn_layer.weight.set_(bn_layer.weight.detach()[keep_idx])
-    bn_layer.bias.set_(bn_layer.bias.detach()[keep_idx])
-    bn_layer.running_mean.set_(bn_layer.running_mean.detach()[keep_idx])
-    bn_layer.running_var.set_(bn_layer.running_var.detach()[keep_idx])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ConvNetWithEfficientNetFeatureExtractor()
 
-    conv_layer.out_channels = n_keep
-    conv_layer.weight.set_(conv_layer.weight.detach()[keep_idx])
+    vgg11 = models.vgg11(pretrained=True)
+    vgg11.features[-1]=torch.nn.Identity()
+    vgg11 = vgg11.features
 
-    if conv_layer.bias is not None:
-        conv_layer.bias.set_(conv_layer.bias.detach()[keep_idx])
+    for param in vgg11.parameters():
+        param.requires_grad = False
+        
+    vgg11 = vgg11.to(device)
 
-    if next_conv.groups > 1:
-        next_conv.groups = n_keep
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=64, shuffle=False)
+    vid_loader = DataLoader(vid_dataset, batch_size=64, shuffle=True)
 
-    next_conv.in_channels = n_keep
-    next_conv.weight.set_(next_conv.weight.detach()[:,keep_idx,:,:])
+    model.load_state_dict(torch.load("./model.pth"))
+    model2 = copy.deepcopy(model)
 
+    model2 = model2.to("cpu")
+    model2.eval()
+    layers = get_all_layers(model2.feature_extractor)
 
-model2.feature_extractor[8] = nn.Identity()
-model2.colorization_layers[0] = nn.Identity()
+    prune_type_1 = []
+    prune_type_2 = []
+    prune_type_3 = []
+    prune_type_4 = []
 
-p_ratio = 0.5
-for i in prune_type_3:
-    conv_layer = layers[i]    
-    next_conv_layer = layers[i+1]
+    for i in range(len(layers)-2):
+        if isinstance(layers[i], nn.Conv2d) and isinstance(layers[i+1], nn.BatchNorm2d):
+            if isinstance(layers[i+2], nn.SiLU):
+                prune_type_1.append(i)
+            else:
+                prune_type_2.append(i)
+        if isinstance(layers[i], nn.Conv2d) and isinstance(layers[i+1],nn.Conv2d):
+            prune_type_3.append(i)
+            prune_type_4.append(i+1)
 
+    conv_layer = model2.colorization_layers[1].conv
+    bn_layer =  model2.colorization_layers[1].bn
+    next_conv =  model2.colorization_layers[2].conv
+
+    p_ratio = 0.3
     n_keep = get_num_channels_to_keep(conv_layer.out_channels, p_ratio)
     keep_idx = get_keep_indices(conv_layer, p_ratio)
-    
-    conv_layer.out_channels = n_keep
-    conv_layer.weight.set_(conv_layer.weight.detach()[keep_idx])
-    
-    if conv_layer.bias is not None:
-        conv_layer.bias.set_(conv_layer.bias.detach()[keep_idx])
 
-    next_conv_layer.weight.set_(next_conv_layer.weight.detach()[:,keep_idx,:,:])
-    if next_conv_layer.groups > 1:
-        next_conv_layer.groups = n_keep
-    next_conv_layer.in_channels = n_keep
+    with torch.no_grad():
+        bn_layer.weight.set_(bn_layer.weight.detach()[keep_idx])
+        bn_layer.bias.set_(bn_layer.bias.detach()[keep_idx])
+        bn_layer.running_mean.set_(bn_layer.running_mean.detach()[keep_idx])
+        bn_layer.running_var.set_(bn_layer.running_var.detach()[keep_idx])
 
+        conv_layer.out_channels = n_keep
+        conv_layer.weight.set_(conv_layer.weight.detach()[keep_idx])
 
-model2.to(device)
-model2.requires_grad_= True
+        if conv_layer.bias is not None:
+            conv_layer.bias.set_(conv_layer.bias.detach()[keep_idx])
 
-optimizer = AdamW(model2.parameters(), lr=1e-5)
-mseloss = MSELoss()
-weighted_mseloss = WeightedMSELoss(value_embedding)
+        if next_conv.groups > 1:
+            next_conv.groups = n_keep
 
-val_loader = DataLoader(val_set, batch_size=64)
-# train(model, train_loader, val_loader, weighted_mseloss, mseloss, optimizer, device, epochs=1)
-# train(model, vid_loader, None, weighted_mseloss, mseloss, optimizer, device, epochs=1)
+        next_conv.in_channels = n_keep
+        next_conv.weight.set_(next_conv.weight.detach()[:,keep_idx,:,:])
 
-torch.save(model2.state_dict(), "model_p.pth")
-torch.cuda.empty_cache()
+    model2.feature_extractor[8] = nn.Identity()
+    model2.colorization_layers[0] = nn.Identity()
+
+    p_ratio = 0.5
+    for i in prune_type_3:
+        conv_layer = layers[i]    
+        next_conv_layer = layers[i+1]
+
+        n_keep = get_num_channels_to_keep(conv_layer.out_channels, p_ratio)
+        keep_idx = get_keep_indices(conv_layer, p_ratio)
+        
+        conv_layer.out_channels = n_keep
+        conv_layer.weight.set_(conv_layer.weight.detach()[keep_idx])
+        
+        if conv_layer.bias is not None:
+            conv_layer.bias.set_(conv_layer.bias.detach()[keep_idx])
+
+        next_conv_layer.weight.set_(next_conv_layer.weight.detach()[:,keep_idx,:,:])
+        if next_conv_layer.groups > 1:
+            next_conv_layer.groups = n_keep
+        next_conv_layer.in_channels = n_keep
+
+    model2.to(device)
+    model2.requires_grad_= True
+    optimizer = AdamW(model2.parameters(), lr=1e-5)
+    mseloss = MSELoss()
+    weighted_mseloss = WeightedMSELoss(value_embedding)
+
+    train(model2, vgg11, train_loader, val_loader, weighted_mseloss, mseloss, optimizer, device, epochs=1)
+
+    torch.save(model2.state_dict(), "model_p.pth")
+    torch.cuda.empty_cache()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Training model.")
+    parser.add_argument("--training_dataset_directory", type=str, help="Dataset directory for training (default = ./val2014)", default="./val2014")
+    parser.add_argument("--sample_dataset_directory", type=str, help="Dataset directory for sample inference (default = ./DAVIS/JPEGImages/480p)", default="./DAVIS/JPEGImages/480p")
+    # parser.add_argument("--epochs", type=int, help="Number of epochs (default = 2)", default=2)
+    args = parser.parse_args()
+
+    main(args.training_dataset_directory, args.sample_dataset_directory)
